@@ -151,6 +151,7 @@ resource "aws_security_group" "notebook" {
 
 ############################################
 # Lifecycle Config: push CPU/Disk metrics every 1 min (cron)
+# IMPORTANT: Dimension NotebookInstanceName = local.notebook_name (SageMaker name)
 ############################################
 resource "aws_sagemaker_notebook_instance_lifecycle_configuration" "metrics" {
   name = "${var.name_prefix}-lc-metrics-${local.suffix}"
@@ -159,13 +160,18 @@ resource "aws_sagemaker_notebook_instance_lifecycle_configuration" "metrics" {
     #!/bin/bash
     set -euo pipefail
 
-    cat >/usr/local/bin/push_metrics.sh <<'SCRIPT'
+    # Inject the SageMaker notebook name from Terraform (stable, matches Alarm)
+    NB_NAME='${local.notebook_name}'
+    REGION='${var.aws_region}'
+    NAMESPACE='${local.metrics_namespace}'
+
+    sudo tee /usr/local/bin/push_metrics.sh >/dev/null <<'EOT'
     #!/bin/bash
     set -euo pipefail
 
-    NOTEBOOK_NAME="$(hostname)"
-    REGION='${var.aws_region}'
-    NAMESPACE='${local.metrics_namespace}'
+    NB_NAME="__NB_NAME__"
+    REGION="__REGION__"
+    NAMESPACE="__NAMESPACE__"
 
     cpu_used() {
       read -r cpu u n s i io irq sirq st g gn < /proc/stat
@@ -185,27 +191,30 @@ resource "aws_sagemaker_notebook_instance_lifecycle_configuration" "metrics" {
     CPU=$(cpu_used || echo 0)
     DISK=$(disk_used || echo 0)
 
+    echo "Sending NB_NAME=$NB_NAME CPU=${CPU}% DISK=${DISK}% REGION=$REGION" >> /var/log/push_metrics.log
+
     aws cloudwatch put-metric-data \
       --region "$REGION" \
       --namespace "$NAMESPACE" \
       --metric-data \
-        "MetricName=CPUUsedPercent,Value=$CPU,Unit=Percent,Dimensions=[{Name=NotebookInstanceName,Value=$NOTEBOOK_NAME}]" \
-        "MetricName=DiskUsedPercent,Value=$DISK,Unit=Percent,Dimensions=[{Name=NotebookInstanceName,Value=$NOTEBOOK_NAME}]"
-    SCRIPT
+        "MetricName=CPUUsedPercent,Value=$CPU,Unit=Percent,Dimensions=[{Name=NotebookInstanceName,Value=$NB_NAME}]" \
+        "MetricName=DiskUsedPercent,Value=$DISK,Unit=Percent,Dimensions=[{Name=NotebookInstanceName,Value=$NB_NAME}]"
+    EOT
 
-    chmod +x /usr/local/bin/push_metrics.sh
+    # Replace placeholders safely
+    sudo sed -i "s|__NB_NAME__|$NB_NAME|g" /usr/local/bin/push_metrics.sh
+    sudo sed -i "s|__REGION__|$REGION|g" /usr/local/bin/push_metrics.sh
+    sudo sed -i "s|__NAMESPACE__|$NAMESPACE|g" /usr/local/bin/push_metrics.sh
+    sudo sed -i 's/\\r$//' /usr/local/bin/push_metrics.sh
 
-    cat >/etc/cron.d/push_metrics <<CRON
-    * * * * * root /usr/local/bin/push_metrics.sh >> /var/log/push_metrics.log 2>&1
-CRON
-    chmod 0644 /etc/cron.d/push_metrics
+    sudo chmod +x /usr/local/bin/push_metrics.sh
 
-    if command -v systemctl >/dev/null 2>&1; then
-      systemctl enable crond || true
-      systemctl restart crond || systemctl start crond || true
-    else
-      service crond restart || service crond start || true
-    fi
+    # cron: every 1 minute
+    echo "* * * * * root /usr/local/bin/push_metrics.sh >> /var/log/push_metrics.log 2>&1" | sudo tee /etc/cron.d/push_metrics >/dev/null
+    sudo chmod 0644 /etc/cron.d/push_metrics
+
+    # start cron service
+    sudo service crond restart || sudo systemctl restart crond || true
   EOF
   )
 }
@@ -231,7 +240,6 @@ resource "aws_sagemaker_notebook_instance" "this" {
 
 ############################################
 # CloudWatch Alarms (state-change notifications)
-# (ยังคงมีไว้เพื่อเห็นสถานะ OK/ALARM)
 ############################################
 resource "aws_cloudwatch_metric_alarm" "cpu_high" {
   alarm_name          = "${local.cw_alarm_prefix}-cpu-high"
@@ -320,17 +328,16 @@ def handler(event, context):
     cpu = latest_avg(CPU_METRIC)
     disk = latest_avg(DISK_METRIC)
 
+    # no datapoints -> don't spam
+    if cpu is None and disk is None:
+        return {"ok": True, "note": "no datapoints"}
+
     breaches = []
     if cpu is not None and cpu >= CPU_THRESH:
         breaches.append(f"CPU {cpu:.1f}% >= {CPU_THRESH:.1f}%")
     if disk is not None and disk >= DISK_THRESH:
         breaches.append(f"Disk {disk:.1f}% >= {DISK_THRESH:.1f}%")
 
-    # ไม่ spam ถ้าไม่มี datapoint
-    if cpu is None and disk is None:
-        return {"ok": True, "note": "no datapoints"}
-
-    # ถ้าไม่ breach ก็ไม่ส่ง
     if not breaches:
         return {"ok": True, "breach": False, "cpu": cpu, "disk": disk}
 
@@ -351,7 +358,6 @@ def handler(event, context):
         Subject=subject[:100],
         Message=json.dumps(payload, indent=2),
     )
-
     return {"ok": True, "breach": True, "breaches": breaches, "cpu": cpu, "disk": disk}
 PY
 }
@@ -395,7 +401,7 @@ data "aws_iam_policy_document" "lambda_policy" {
 
   statement {
     effect = "Allow"
-    actions = ["sns:Publish"]
+    actions   = ["sns:Publish"]
     resources = [aws_sns_topic.alarms.arn]
   }
 

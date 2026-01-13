@@ -1,81 +1,69 @@
 variable "aws_region" {
-  description = "AWS region"
-  type        = string
-  default     = "ap-southeast-1"
+  type    = string
+  default = "ap-southeast-1"
 }
 
 variable "name_prefix" {
-  description = "Prefix for all resources"
-  type        = string
-  default     = "demo-sagemaker"
+  type    = string
+  default = "poc-notebook"
 }
 
 variable "notebook_instance_type" {
-  description = "SageMaker Notebook instance type"
-  type        = string
-  default     = "ml.t3.medium"
+  type    = string
+  default = "ml.t3.medium"
 }
 
 variable "notebook_volume_size" {
-  description = "EBS volume size (GB) for notebook"
-  type        = number
-  default     = 20
+  type    = number
+  default = 30
 }
 
 variable "direct_internet_access" {
-  description = "Enabled or Disabled for notebook direct internet"
-  type        = string
-  default     = "Enabled"
+  type    = string
+  default = "Enabled"
   validation {
     condition     = contains(["Enabled", "Disabled"], var.direct_internet_access)
     error_message = "direct_internet_access must be Enabled or Disabled"
   }
 }
 
-variable "vpc_id" {
-  description = "Optional VPC ID. Leave empty to use Default VPC."
-  type        = string
-  default     = ""
-}
-
-variable "subnet_id" {
-  description = "Optional Subnet ID. Leave empty to auto-pick a default subnet in the VPC."
-  type        = string
-  default     = ""
-}
-
 variable "allowed_cidrs" {
-  description = "CIDRs allowed to access the notebook (HTTPS 443). For safety, set to your public IP /32."
-  type        = list(string)
-  default     = ["0.0.0.0/0"]
+  type    = list(string)
+  default = ["0.0.0.0/0"]
 }
 
 variable "alarm_email" {
-  description = "Email for SNS alarm subscription (must confirm via email)."
-  type        = string
+  type = string
 }
 
-# --- CloudWatch Alarm thresholds ---
 variable "alarm_cpu_threshold" {
-  description = "CPUUtilization threshold (%)"
-  type        = number
-  default     = 80
+  type    = number
+  default = 80
 }
 
 variable "alarm_disk_threshold" {
-  description = "DiskUtilization threshold (%)"
-  type        = number
-  default     = 85
+  type    = number
+  default = 85
 }
 
+# Alarm (state-change) settings - optional, you can keep for visibility
 variable "alarm_period_seconds" {
-  description = "Alarm period in seconds"
-  type        = number
-  default     = 300
+  type    = number
+  default = 60
 }
 
 variable "alarm_evaluation_periods" {
-  description = "How many periods to evaluate"
-  type        = number
-  default     = 2
+  type    = number
+  default = 1
+}
+
+# Optional VPC/Subnet
+variable "vpc_id" {
+  type    = string
+  default = ""
+}
+
+variable "subnet_id" {
+  type    = string
+  default = ""
 }

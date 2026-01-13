@@ -11,7 +11,7 @@ output "notebook_url" {
 }
 
 output "s3_bucket_name" {
-  value = aws_s3_bucket.notebook.bucket
+  value = aws_s3_bucket.this.bucket
 }
 
 output "sns_topic_arn" {
@@ -28,4 +28,12 @@ output "subnet_id" {
 
 output "vpc_id" {
   value = local.resolved_vpc_id
+}
+
+output "event_rule_name" {
+  value = aws_cloudwatch_event_rule.every_5_min.name
+}
+
+output "lambda_function_name" {
+  value = aws_lambda_function.notifier.function_name
 }

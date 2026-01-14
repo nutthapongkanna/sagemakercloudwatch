@@ -160,7 +160,6 @@ resource "aws_sagemaker_notebook_instance_lifecycle_configuration" "metrics" {
     #!/bin/bash
     set -euo pipefail
 
-    # Inject the SageMaker notebook name from Terraform (stable, matches Alarm)
     NB_NAME='${local.notebook_name}'
     REGION='${var.aws_region}'
     NAMESPACE='${local.metrics_namespace}'
@@ -191,7 +190,8 @@ resource "aws_sagemaker_notebook_instance_lifecycle_configuration" "metrics" {
     CPU=$(cpu_used || echo 0)
     DISK=$(disk_used || echo 0)
 
-    echo "Sending NB_NAME=$NB_NAME CPU=${CPU}% DISK=${DISK}% REGION=$REGION" >> /var/log/push_metrics.log
+    # ✅ IMPORTANT: use $CPU / $DISK (NOT ${CPU}) so Terraform won't interpolate
+    echo "Sending NB_NAME=$NB_NAME CPU=$CPU% DISK=$DISK% REGION=$REGION" >> /var/log/push_metrics.log
 
     aws cloudwatch put-metric-data \
       --region "$REGION" \
@@ -201,7 +201,6 @@ resource "aws_sagemaker_notebook_instance_lifecycle_configuration" "metrics" {
         "MetricName=DiskUsedPercent,Value=$DISK,Unit=Percent,Dimensions=[{Name=NotebookInstanceName,Value=$NB_NAME}]"
     EOT
 
-    # Replace placeholders safely
     sudo sed -i "s|__NB_NAME__|$NB_NAME|g" /usr/local/bin/push_metrics.sh
     sudo sed -i "s|__REGION__|$REGION|g" /usr/local/bin/push_metrics.sh
     sudo sed -i "s|__NAMESPACE__|$NAMESPACE|g" /usr/local/bin/push_metrics.sh
@@ -209,11 +208,8 @@ resource "aws_sagemaker_notebook_instance_lifecycle_configuration" "metrics" {
 
     sudo chmod +x /usr/local/bin/push_metrics.sh
 
-    # cron: every 1 minute
     echo "* * * * * root /usr/local/bin/push_metrics.sh >> /var/log/push_metrics.log 2>&1" | sudo tee /etc/cron.d/push_metrics >/dev/null
     sudo chmod 0644 /etc/cron.d/push_metrics
-
-    # start cron service
     sudo service crond restart || sudo systemctl restart crond || true
   EOF
   )
@@ -233,9 +229,7 @@ resource "aws_sagemaker_notebook_instance" "this" {
 
   lifecycle_config_name  = aws_sagemaker_notebook_instance_lifecycle_configuration.metrics.name
 
-  tags = {
-    Name = local.notebook_name
-  }
+  tags = { Name = local.notebook_name }
 }
 
 ############################################
@@ -308,7 +302,6 @@ WINDOW_MIN    = int(os.environ.get("WINDOW_MINUTES", "10"))
 def latest_avg(metric_name: str):
     end = datetime.now(timezone.utc)
     start = end - timedelta(minutes=WINDOW_MIN)
-
     resp = cw.get_metric_statistics(
         Namespace=NAMESPACE,
         MetricName=metric_name,
@@ -328,7 +321,6 @@ def handler(event, context):
     cpu = latest_avg(CPU_METRIC)
     disk = latest_avg(DISK_METRIC)
 
-    # no datapoints -> don't spam
     if cpu is None and disk is None:
         return {"ok": True, "note": "no datapoints"}
 
@@ -400,7 +392,7 @@ data "aws_iam_policy_document" "lambda_policy" {
   }
 
   statement {
-    effect = "Allow"
+    effect    = "Allow"
     actions   = ["sns:Publish"]
     resources = [aws_sns_topic.alarms.arn]
   }

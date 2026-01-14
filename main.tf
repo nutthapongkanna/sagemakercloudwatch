@@ -190,7 +190,6 @@ resource "aws_sagemaker_notebook_instance_lifecycle_configuration" "metrics" {
     CPU=$(cpu_used || echo 0)
     DISK=$(disk_used || echo 0)
 
-    # ✅ IMPORTANT: use $CPU / $DISK (NOT ${CPU}) so Terraform won't interpolate
     echo "Sending NB_NAME=$NB_NAME CPU=$CPU% DISK=$DISK% REGION=$REGION" >> /var/log/push_metrics.log
 
     aws cloudwatch put-metric-data \

@@ -154,3 +154,9 @@ variable "lambda_timeout_seconds" {
   description = "Lambda timeout"
   default     = 30
 }
+
+variable "alarm_mem_threshold" {
+  type        = number
+  description = "Threshold for MemoryUsedPercent"
+  default     = 80
+}

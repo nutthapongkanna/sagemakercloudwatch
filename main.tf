@@ -77,8 +77,9 @@ resource "aws_sns_topic_subscription" "email" {
 ############################################
 data "aws_iam_policy_document" "assume_sagemaker" {
   statement {
-    effect = "Allow"
+    effect  = "Allow"
     actions = ["sts:AssumeRole"]
+
     principals {
       type        = "Service"
       identifiers = ["sagemaker.amazonaws.com"]
@@ -93,30 +94,30 @@ resource "aws_iam_role" "sagemaker" {
 
 data "aws_iam_policy_document" "sagemaker_inline" {
   statement {
-    sid     = "S3AccessThisBucket"
-    effect  = "Allow"
-    actions = ["s3:ListBucket"]
+    sid       = "S3AccessThisBucket"
+    effect    = "Allow"
+    actions   = ["s3:ListBucket"]
     resources = [aws_s3_bucket.this.arn]
   }
 
   statement {
-    sid     = "S3ObjectAccessThisBucket"
-    effect  = "Allow"
-    actions = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+    sid       = "S3ObjectAccessThisBucket"
+    effect    = "Allow"
+    actions   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
     resources = ["${aws_s3_bucket.this.arn}/*"]
   }
 
   statement {
-    sid     = "PutCustomMetrics"
-    effect  = "Allow"
-    actions = ["cloudwatch:PutMetricData"]
+    sid       = "PutCustomMetrics"
+    effect    = "Allow"
+    actions   = ["cloudwatch:PutMetricData"]
     resources = ["*"]
   }
 
   statement {
-    sid     = "LogsBasic"
-    effect  = "Allow"
-    actions = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+    sid       = "LogsBasic"
+    effect    = "Allow"
+    actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
     resources = ["*"]
   }
 }
@@ -150,7 +151,7 @@ resource "aws_security_group" "notebook" {
 }
 
 ############################################
-# Lifecycle Config: push CPU/Disk metrics every 1 min (cron)
+# Lifecycle Config: push CPU/Disk/Memory metrics every 1 min (cron)
 # IMPORTANT: Dimension NotebookInstanceName = local.notebook_name (SageMaker name)
 ############################################
 resource "aws_sagemaker_notebook_instance_lifecycle_configuration" "metrics" {
@@ -172,6 +173,8 @@ resource "aws_sagemaker_notebook_instance_lifecycle_configuration" "metrics" {
     REGION="__REGION__"
     NAMESPACE="__NAMESPACE__"
 
+    AWS_BIN="$(command -v aws || true)"
+
     cpu_used() {
       read -r cpu u n s i io irq sirq st g gn < /proc/stat
       idle1=$((i+io)); total1=$((u+n+s+irq+sirq+st+idle1))
@@ -187,17 +190,29 @@ resource "aws_sagemaker_notebook_instance_lifecycle_configuration" "metrics" {
       df -P / | awk 'NR==2 {gsub("%","",$5); print $5}'
     }
 
+    mem_used() {
+      awk '
+        /MemTotal/ {t=$2}
+        /MemAvailable/ {a=$2}
+        END {
+          if (t<=0) {print 0; exit}
+          print int(100*(t-a)/t)
+        }' /proc/meminfo
+    }
+
     CPU=$(cpu_used || echo 0)
     DISK=$(disk_used || echo 0)
+    MEM=$(mem_used || echo 0)
 
-    echo "Sending NB_NAME=$NB_NAME CPU=$CPU% DISK=$DISK% REGION=$REGION" >> /var/log/push_metrics.log
+    echo "$(date -Is) Sending NB_NAME=$NB_NAME CPU=$CPU% DISK=$DISK% MEM=$MEM% REGION=$REGION AWS_BIN=$AWS_BIN" >> /var/log/push_metrics.log
 
-    aws cloudwatch put-metric-data \
+    "$AWS_BIN" cloudwatch put-metric-data \
       --region "$REGION" \
       --namespace "$NAMESPACE" \
       --metric-data \
         "MetricName=CPUUsedPercent,Value=$CPU,Unit=Percent,Dimensions=[{Name=NotebookInstanceName,Value=$NB_NAME}]" \
-        "MetricName=DiskUsedPercent,Value=$DISK,Unit=Percent,Dimensions=[{Name=NotebookInstanceName,Value=$NB_NAME}]"
+        "MetricName=DiskUsedPercent,Value=$DISK,Unit=Percent,Dimensions=[{Name=NotebookInstanceName,Value=$NB_NAME}]" \
+        "MetricName=MemoryUsedPercent,Value=$MEM,Unit=Percent,Dimensions=[{Name=NotebookInstanceName,Value=$NB_NAME}]"
     EOT
 
     sudo sed -i "s|__NB_NAME__|$NB_NAME|g" /usr/local/bin/push_metrics.sh
@@ -209,7 +224,9 @@ resource "aws_sagemaker_notebook_instance_lifecycle_configuration" "metrics" {
 
     echo "* * * * * root /usr/local/bin/push_metrics.sh >> /var/log/push_metrics.log 2>&1" | sudo tee /etc/cron.d/push_metrics >/dev/null
     sudo chmod 0644 /etc/cron.d/push_metrics
-    sudo service crond restart || sudo systemctl restart crond || true
+
+    # restart cron in a robust way
+    sudo systemctl restart cron 2>/dev/null || sudo systemctl restart crond 2>/dev/null || sudo service cron restart 2>/dev/null || sudo service crond restart 2>/dev/null || true
   EOF
   )
 }
@@ -226,7 +243,7 @@ resource "aws_sagemaker_notebook_instance" "this" {
   volume_size            = var.notebook_volume_size
   direct_internet_access = var.direct_internet_access
 
-  lifecycle_config_name  = aws_sagemaker_notebook_instance_lifecycle_configuration.metrics.name
+  lifecycle_config_name = aws_sagemaker_notebook_instance_lifecycle_configuration.metrics.name
 
   tags = { Name = local.notebook_name }
 }
@@ -276,6 +293,27 @@ resource "aws_cloudwatch_metric_alarm" "disk_high" {
   ok_actions    = [aws_sns_topic.alarms.arn]
 }
 
+resource "aws_cloudwatch_metric_alarm" "memory_high" {
+  alarm_name          = "${local.cw_alarm_prefix}-memory-high"
+  alarm_description   = "MemoryUsedPercent high on ${local.notebook_name}"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = var.alarm_evaluation_periods
+  period              = var.alarm_period_seconds
+  statistic           = "Average"
+  threshold           = var.alarm_mem_threshold
+  treat_missing_data  = "missing"
+
+  namespace   = local.metrics_namespace
+  metric_name = "MemoryUsedPercent"
+
+  dimensions = {
+    NotebookInstanceName = aws_sagemaker_notebook_instance.this.name
+  }
+
+  alarm_actions = [aws_sns_topic.alarms.arn]
+  ok_actions    = [aws_sns_topic.alarms.arn]
+}
+
 ############################################
 # Lambda + EventBridge: repeat email every 5 minutes while breached
 ############################################
@@ -294,8 +332,12 @@ NAMESPACE     = os.environ["NAMESPACE"]
 
 CPU_METRIC    = os.environ.get("CPU_METRIC", "CPUUsedPercent")
 DISK_METRIC   = os.environ.get("DISK_METRIC", "DiskUsedPercent")
+MEM_METRIC    = os.environ.get("MEM_METRIC", "MemoryUsedPercent")
+
 CPU_THRESH    = float(os.environ.get("CPU_THRESHOLD", "80"))
 DISK_THRESH   = float(os.environ.get("DISK_THRESHOLD", "85"))
+MEM_THRESH    = float(os.environ.get("MEM_THRESHOLD", "80"))
+
 WINDOW_MIN    = int(os.environ.get("WINDOW_MINUTES", "10"))
 
 def latest_avg(metric_name: str):
@@ -317,10 +359,11 @@ def latest_avg(metric_name: str):
     return float(dps[-1]["Average"])
 
 def handler(event, context):
-    cpu = latest_avg(CPU_METRIC)
+    cpu  = latest_avg(CPU_METRIC)
     disk = latest_avg(DISK_METRIC)
+    mem  = latest_avg(MEM_METRIC)
 
-    if cpu is None and disk is None:
+    if cpu is None and disk is None and mem is None:
         return {"ok": True, "note": "no datapoints"}
 
     breaches = []
@@ -328,9 +371,11 @@ def handler(event, context):
         breaches.append(f"CPU {cpu:.1f}% >= {CPU_THRESH:.1f}%")
     if disk is not None and disk >= DISK_THRESH:
         breaches.append(f"Disk {disk:.1f}% >= {DISK_THRESH:.1f}%")
+    if mem is not None and mem >= MEM_THRESH:
+        breaches.append(f"Memory {mem:.1f}% >= {MEM_THRESH:.1f}%")
 
     if not breaches:
-        return {"ok": True, "breach": False, "cpu": cpu, "disk": disk}
+        return {"ok": True, "breach": False, "cpu": cpu, "disk": disk, "mem": mem}
 
     payload = {
         "time_utc": datetime.now(timezone.utc).isoformat(),
@@ -338,7 +383,8 @@ def handler(event, context):
         "namespace": NAMESPACE,
         "cpu_avg": cpu,
         "disk_avg": disk,
-        "thresholds": {"cpu": CPU_THRESH, "disk": DISK_THRESH},
+        "mem_avg": mem,
+        "thresholds": {"cpu": CPU_THRESH, "disk": DISK_THRESH, "mem": MEM_THRESH},
         "breaches": breaches,
         "repeat": "This email repeats every 5 minutes while still breached."
     }
@@ -349,7 +395,7 @@ def handler(event, context):
         Subject=subject[:100],
         Message=json.dumps(payload, indent=2),
     )
-    return {"ok": True, "breach": True, "breaches": breaches, "cpu": cpu, "disk": disk}
+    return {"ok": True, "breach": True, "breaches": breaches, "cpu": cpu, "disk": disk, "mem": mem}
 PY
 }
 
@@ -366,8 +412,9 @@ data "archive_file" "lambda_zip" {
 
 data "aws_iam_policy_document" "lambda_assume" {
   statement {
-    effect = "Allow"
+    effect  = "Allow"
     actions = ["sts:AssumeRole"]
+
     principals {
       type        = "Service"
       identifiers = ["lambda.amazonaws.com"]
@@ -432,8 +479,11 @@ resource "aws_lambda_function" "notifier" {
 
       CPU_METRIC     = "CPUUsedPercent"
       DISK_METRIC    = "DiskUsedPercent"
+      MEM_METRIC     = "MemoryUsedPercent"
+
       CPU_THRESHOLD  = tostring(var.alarm_cpu_threshold)
       DISK_THRESHOLD = tostring(var.alarm_disk_threshold)
+      MEM_THRESHOLD  = tostring(var.alarm_mem_threshold)
 
       WINDOW_MINUTES = "10"
     }

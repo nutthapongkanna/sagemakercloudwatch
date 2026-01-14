@@ -24,6 +24,7 @@ alarm_period_seconds     = 60
 alarm_evaluation_periods = 1
 alarm_cpu_threshold      = 20
 alarm_disk_threshold     = 20
+alarm_mem_threshold      = 20
 alarm_treat_missing_data = "missing"
 
 # repeat notifier

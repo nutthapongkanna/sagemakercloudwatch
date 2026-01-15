@@ -12,12 +12,15 @@ resource "random_id" "suffix" {
 ############################################
 locals {
   suffix          = random_id.suffix.hex
-  notebook_name   = "${var.name_prefix}-nb-${local.suffix}"
   bucket_name     = lower("${var.name_prefix}-bucket-${data.aws_caller_identity.current.account_id}-${local.suffix}")
   sns_topic_name  = "${var.name_prefix}-alerts-${local.suffix}"
   cw_alarm_prefix = "${var.name_prefix}-alarm-${local.suffix}"
 
-  metrics_namespace = "POC/Notebook"
+  studio_domain_name = "${var.name_prefix}-studio-${local.suffix}"
+  user_profile_name  = "${var.name_prefix}-user-${local.suffix}"
+
+  # Custom metrics namespace
+  metrics_namespace = "POC/Studio"
 }
 
 ############################################
@@ -33,7 +36,7 @@ locals {
 }
 
 data "aws_subnets" "default" {
-  count = var.subnet_id == "" ? 1 : 0
+  count = length(var.subnet_ids) == 0 ? 1 : 0
   filter {
     name   = "vpc-id"
     values = [local.resolved_vpc_id]
@@ -41,7 +44,8 @@ data "aws_subnets" "default" {
 }
 
 locals {
-  resolved_subnet_id = var.subnet_id != "" ? var.subnet_id : data.aws_subnets.default[0].ids[0]
+  # ✅ one-line ternary (กันพัง)
+  resolved_subnet_ids = length(var.subnet_ids) > 0 ? var.subnet_ids : data.aws_subnets.default[0].ids
 }
 
 ############################################
@@ -73,7 +77,7 @@ resource "aws_sns_topic_subscription" "email" {
 }
 
 ############################################
-# IAM Role for SageMaker Notebook
+# IAM Role for SageMaker Studio (Execution Role)
 ############################################
 data "aws_iam_policy_document" "assume_sagemaker" {
   statement {
@@ -88,58 +92,61 @@ data "aws_iam_policy_document" "assume_sagemaker" {
 }
 
 resource "aws_iam_role" "sagemaker" {
-  name               = "${var.name_prefix}-role-${local.suffix}"
+  name               = "${var.name_prefix}-studio-role-${local.suffix}"
   assume_role_policy = data.aws_iam_policy_document.assume_sagemaker.json
 }
 
-data "aws_iam_policy_document" "sagemaker_inline" {
-  statement {
-    sid       = "S3AccessThisBucket"
-    effect    = "Allow"
-    actions   = ["s3:ListBucket"]
-    resources = [aws_s3_bucket.this.arn]
-  }
+# ============================================================
+# ✅ POC MAX Permissions (แก้ปัญหา CreateSpace/AddTags/PresignedUrl ฯลฯ)
+# ============================================================
+resource "aws_iam_role_policy" "sagemaker_poc_max" {
+  name = "${var.name_prefix}-studio-pocmax-${local.suffix}"
+  role = aws_iam_role.sagemaker.id
 
-  statement {
-    sid       = "S3ObjectAccessThisBucket"
-    effect    = "Allow"
-    actions   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
-    resources = ["${aws_s3_bucket.this.arn}/*"]
-  }
-
-  statement {
-    sid       = "PutCustomMetrics"
-    effect    = "Allow"
-    actions   = ["cloudwatch:PutMetricData"]
-    resources = ["*"]
-  }
-
-  statement {
-    sid       = "LogsBasic"
-    effect    = "Allow"
-    actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
-    resources = ["*"]
-  }
-}
-
-resource "aws_iam_role_policy" "sagemaker_inline" {
-  name   = "${var.name_prefix}-inline-${local.suffix}"
-  role   = aws_iam_role.sagemaker.id
-  policy = data.aws_iam_policy_document.sagemaker_inline.json
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect   = "Allow",
+        Action   = "sagemaker:*",
+        Resource = "*"
+      },
+      {
+        # Studio/Space มักต้อง PassRole
+        Effect   = "Allow",
+        Action   = "iam:PassRole",
+        Resource = "*"
+      },
+      {
+        # Monitoring / Logs / Infra ที่เกี่ยวข้อง
+        Effect = "Allow",
+        Action = [
+          "cloudwatch:*",
+          "logs:*",
+          "ec2:*",
+          "efs:*",
+          "s3:*"
+        ],
+        Resource = "*"
+      }
+    ]
+  })
 }
 
 ############################################
-# Security Group for Notebook
+# Security Group for Studio Apps
 ############################################
-resource "aws_security_group" "notebook" {
-  name   = "${var.name_prefix}-nb-sg-${local.suffix}"
+resource "aws_security_group" "studio" {
+  name   = "${var.name_prefix}-studio-sg-${local.suffix}"
   vpc_id = local.resolved_vpc_id
 
+  # allow internal traffic within the SG (common for EFS/app comms)
   ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = var.allowed_cidrs
+    description = "self"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    self        = true
   }
 
   egress {
@@ -151,17 +158,19 @@ resource "aws_security_group" "notebook" {
 }
 
 ############################################
-# Lifecycle Config: push CPU/Disk/Memory metrics every 1 min (cron)
-# IMPORTANT: Dimension NotebookInstanceName = local.notebook_name (SageMaker name)
+# Studio Lifecycle Config (JupyterServer)
+# Push CPU/Disk/Memory metrics every 1 min (cron)
+# Dimension: UserProfileName = local.user_profile_name
 ############################################
-resource "aws_sagemaker_notebook_instance_lifecycle_configuration" "metrics" {
-  name = "${var.name_prefix}-lc-metrics-${local.suffix}"
+resource "aws_sagemaker_studio_lifecycle_config" "metrics" {
+  studio_lifecycle_config_name     = "${var.name_prefix}-lc-metrics-${local.suffix}"
+  studio_lifecycle_config_app_type = "JupyterServer"
 
-  on_start = base64encode(<<-EOF
+  studio_lifecycle_config_content = base64encode(<<-EOF
     #!/bin/bash
     set -euo pipefail
 
-    NB_NAME='${local.notebook_name}'
+    USER_PROFILE='${local.user_profile_name}'
     REGION='${var.aws_region}'
     NAMESPACE='${local.metrics_namespace}'
 
@@ -169,7 +178,7 @@ resource "aws_sagemaker_notebook_instance_lifecycle_configuration" "metrics" {
     #!/bin/bash
     set -euo pipefail
 
-    NB_NAME="__NB_NAME__"
+    USER_PROFILE="__USER_PROFILE__"
     REGION="__REGION__"
     NAMESPACE="__NAMESPACE__"
 
@@ -204,48 +213,68 @@ resource "aws_sagemaker_notebook_instance_lifecycle_configuration" "metrics" {
     DISK=$(disk_used || echo 0)
     MEM=$(mem_used || echo 0)
 
-    echo "$(date -Is) Sending NB_NAME=$NB_NAME CPU=$CPU% DISK=$DISK% MEM=$MEM% REGION=$REGION AWS_BIN=$AWS_BIN" >> /var/log/push_metrics.log
+    echo "$(date -Is) Sending USER_PROFILE=$USER_PROFILE CPU=$CPU% DISK=$DISK% MEM=$MEM% REGION=$REGION AWS_BIN=$AWS_BIN" >> /var/log/push_metrics.log
 
     "$AWS_BIN" cloudwatch put-metric-data \
       --region "$REGION" \
       --namespace "$NAMESPACE" \
       --metric-data \
-        "MetricName=CPUUsedPercent,Value=$CPU,Unit=Percent,Dimensions=[{Name=NotebookInstanceName,Value=$NB_NAME}]" \
-        "MetricName=DiskUsedPercent,Value=$DISK,Unit=Percent,Dimensions=[{Name=NotebookInstanceName,Value=$NB_NAME}]" \
-        "MetricName=MemoryUsedPercent,Value=$MEM,Unit=Percent,Dimensions=[{Name=NotebookInstanceName,Value=$NB_NAME}]"
+        "MetricName=CPUUsedPercent,Value=$CPU,Unit=Percent,Dimensions=[{Name=UserProfileName,Value=$USER_PROFILE}]" \
+        "MetricName=DiskUsedPercent,Value=$DISK,Unit=Percent,Dimensions=[{Name=UserProfileName,Value=$USER_PROFILE}]" \
+        "MetricName=MemoryUsedPercent,Value=$MEM,Unit=Percent,Dimensions=[{Name=UserProfileName,Value=$USER_PROFILE}]"
     EOT
 
-    sudo sed -i "s|__NB_NAME__|$NB_NAME|g" /usr/local/bin/push_metrics.sh
+    sudo sed -i "s|__USER_PROFILE__|$USER_PROFILE|g" /usr/local/bin/push_metrics.sh
     sudo sed -i "s|__REGION__|$REGION|g" /usr/local/bin/push_metrics.sh
     sudo sed -i "s|__NAMESPACE__|$NAMESPACE|g" /usr/local/bin/push_metrics.sh
     sudo sed -i 's/\\r$//' /usr/local/bin/push_metrics.sh
-
     sudo chmod +x /usr/local/bin/push_metrics.sh
 
     echo "* * * * * root /usr/local/bin/push_metrics.sh >> /var/log/push_metrics.log 2>&1" | sudo tee /etc/cron.d/push_metrics >/dev/null
     sudo chmod 0644 /etc/cron.d/push_metrics
 
-    # restart cron in a robust way
     sudo systemctl restart cron 2>/dev/null || sudo systemctl restart crond 2>/dev/null || sudo service cron restart 2>/dev/null || sudo service crond restart 2>/dev/null || true
   EOF
   )
 }
 
 ############################################
-# SageMaker Notebook Instance
+# SageMaker Studio Domain + User Profile
 ############################################
-resource "aws_sagemaker_notebook_instance" "this" {
-  name                   = local.notebook_name
-  role_arn               = aws_iam_role.sagemaker.arn
-  instance_type          = var.notebook_instance_type
-  subnet_id              = local.resolved_subnet_id
-  security_groups        = [aws_security_group.notebook.id]
-  volume_size            = var.notebook_volume_size
-  direct_internet_access = var.direct_internet_access
+resource "aws_sagemaker_domain" "this" {
+  domain_name = local.studio_domain_name
+  auth_mode   = "IAM"
+  vpc_id      = local.resolved_vpc_id
 
-  lifecycle_config_name = aws_sagemaker_notebook_instance_lifecycle_configuration.metrics.name
+  # Studio มักใช้ 2 subnets คนละ AZ
+  subnet_ids = slice(local.resolved_subnet_ids, 0, min(length(local.resolved_subnet_ids), 2))
 
-  tags = { Name = local.notebook_name }
+  # PublicInternetOnly: ง่ายสุด
+  # VpcOnly: private ต้องทำ VPC endpoints เพิ่มถึงจะลื่น
+  app_network_access_type = var.studio_app_network_access_type
+
+  default_user_settings {
+    execution_role  = aws_iam_role.sagemaker.arn
+    security_groups = [aws_security_group.studio.id]
+
+    jupyter_server_app_settings {
+      lifecycle_config_arns = [aws_sagemaker_studio_lifecycle_config.metrics.arn]
+    }
+  }
+
+  # ✅ เพิ่มตามที่คุณขอ: default_space_settings
+  default_space_settings {
+    execution_role  = aws_iam_role.sagemaker.arn
+    security_groups = [aws_security_group.studio.id]
+  }
+
+  tags = { Name = local.studio_domain_name }
+}
+
+resource "aws_sagemaker_user_profile" "this" {
+  domain_id         = aws_sagemaker_domain.this.id
+  user_profile_name = local.user_profile_name
+  tags              = { Name = local.user_profile_name }
 }
 
 ############################################
@@ -253,7 +282,7 @@ resource "aws_sagemaker_notebook_instance" "this" {
 ############################################
 resource "aws_cloudwatch_metric_alarm" "cpu_high" {
   alarm_name          = "${local.cw_alarm_prefix}-cpu-high"
-  alarm_description   = "CPUUsedPercent high on ${local.notebook_name}"
+  alarm_description   = "CPUUsedPercent high on Studio user ${local.user_profile_name}"
   comparison_operator = "GreaterThanOrEqualToThreshold"
   evaluation_periods  = var.alarm_evaluation_periods
   period              = var.alarm_period_seconds
@@ -265,7 +294,7 @@ resource "aws_cloudwatch_metric_alarm" "cpu_high" {
   metric_name = "CPUUsedPercent"
 
   dimensions = {
-    NotebookInstanceName = aws_sagemaker_notebook_instance.this.name
+    UserProfileName = aws_sagemaker_user_profile.this.user_profile_name
   }
 
   alarm_actions = [aws_sns_topic.alarms.arn]
@@ -274,7 +303,7 @@ resource "aws_cloudwatch_metric_alarm" "cpu_high" {
 
 resource "aws_cloudwatch_metric_alarm" "disk_high" {
   alarm_name          = "${local.cw_alarm_prefix}-disk-high"
-  alarm_description   = "DiskUsedPercent high on ${local.notebook_name}"
+  alarm_description   = "DiskUsedPercent high on Studio user ${local.user_profile_name}"
   comparison_operator = "GreaterThanOrEqualToThreshold"
   evaluation_periods  = var.alarm_evaluation_periods
   period              = var.alarm_period_seconds
@@ -286,7 +315,7 @@ resource "aws_cloudwatch_metric_alarm" "disk_high" {
   metric_name = "DiskUsedPercent"
 
   dimensions = {
-    NotebookInstanceName = aws_sagemaker_notebook_instance.this.name
+    UserProfileName = aws_sagemaker_user_profile.this.user_profile_name
   }
 
   alarm_actions = [aws_sns_topic.alarms.arn]
@@ -295,7 +324,7 @@ resource "aws_cloudwatch_metric_alarm" "disk_high" {
 
 resource "aws_cloudwatch_metric_alarm" "memory_high" {
   alarm_name          = "${local.cw_alarm_prefix}-memory-high"
-  alarm_description   = "MemoryUsedPercent high on ${local.notebook_name}"
+  alarm_description   = "MemoryUsedPercent high on Studio user ${local.user_profile_name}"
   comparison_operator = "GreaterThanOrEqualToThreshold"
   evaluation_periods  = var.alarm_evaluation_periods
   period              = var.alarm_period_seconds
@@ -307,7 +336,7 @@ resource "aws_cloudwatch_metric_alarm" "memory_high" {
   metric_name = "MemoryUsedPercent"
 
   dimensions = {
-    NotebookInstanceName = aws_sagemaker_notebook_instance.this.name
+    UserProfileName = aws_sagemaker_user_profile.this.user_profile_name
   }
 
   alarm_actions = [aws_sns_topic.alarms.arn]
@@ -326,9 +355,10 @@ import boto3
 cw  = boto3.client("cloudwatch")
 sns = boto3.client("sns")
 
-SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
-NOTEBOOK_NAME = os.environ["NOTEBOOK_NAME"]
-NAMESPACE     = os.environ["NAMESPACE"]
+SNS_TOPIC_ARN    = os.environ["SNS_TOPIC_ARN"]
+NAMESPACE        = os.environ["NAMESPACE"]
+DIM_NAME         = os.environ.get("DIM_NAME", "UserProfileName")
+DIM_VALUE        = os.environ["DIM_VALUE"]
 
 CPU_METRIC    = os.environ.get("CPU_METRIC", "CPUUsedPercent")
 DISK_METRIC   = os.environ.get("DISK_METRIC", "DiskUsedPercent")
@@ -346,7 +376,7 @@ def latest_avg(metric_name: str):
     resp = cw.get_metric_statistics(
         Namespace=NAMESPACE,
         MetricName=metric_name,
-        Dimensions=[{"Name": "NotebookInstanceName", "Value": NOTEBOOK_NAME}],
+        Dimensions=[{"Name": DIM_NAME, "Value": DIM_VALUE}],
         StartTime=start,
         EndTime=end,
         Period=60,
@@ -379,8 +409,8 @@ def handler(event, context):
 
     payload = {
         "time_utc": datetime.now(timezone.utc).isoformat(),
-        "notebook": NOTEBOOK_NAME,
         "namespace": NAMESPACE,
+        "dimension": {DIM_NAME: DIM_VALUE},
         "cpu_avg": cpu,
         "disk_avg": disk,
         "mem_avg": mem,
@@ -389,7 +419,7 @@ def handler(event, context):
         "repeat": "This email repeats every 5 minutes while still breached."
     }
 
-    subject = f"[ALERT] {NOTEBOOK_NAME} still breached"
+    subject = f"[ALERT] Studio {DIM_VALUE} still breached"
     sns.publish(
         TopicArn=SNS_TOPIC_ARN,
         Subject=subject[:100],
@@ -414,7 +444,6 @@ data "aws_iam_policy_document" "lambda_assume" {
   statement {
     effect  = "Allow"
     actions = ["sts:AssumeRole"]
-
     principals {
       type        = "Service"
       identifiers = ["lambda.amazonaws.com"]
@@ -474,8 +503,10 @@ resource "aws_lambda_function" "notifier" {
   environment {
     variables = {
       SNS_TOPIC_ARN  = aws_sns_topic.alarms.arn
-      NOTEBOOK_NAME  = aws_sagemaker_notebook_instance.this.name
       NAMESPACE      = local.metrics_namespace
+
+      DIM_NAME       = "UserProfileName"
+      DIM_VALUE      = aws_sagemaker_user_profile.this.user_profile_name
 
       CPU_METRIC     = "CPUUsedPercent"
       DISK_METRIC    = "DiskUsedPercent"
